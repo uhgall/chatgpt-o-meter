@@ -45,7 +45,7 @@ again and it will pick up and continue where it was stopped.
 ## Usage
 
 1. Download your data from ChatGPT (top right -> Settings -> Data Controls -> Export your data)
-2. Unzip that file into `input/openai`; the tool then only looks at `conversations.json`
+2. Put that file into the working directory for the code (same as where openai_analyzer.py is)
 3. Run the analysis script:
    ```
    python openai_analyzer.py

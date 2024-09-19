@@ -3,25 +3,24 @@ from dataclasses import dataclass
 from typing import List, Dict, Tuple
 from datetime import datetime
 import html
-import openai
 import time
 import csv
 import os
 import random
 import tiktoken
 import sys
+from collections import defaultdict
+from calendar import month_name
+
+from openai import OpenAI
 from openai import OpenAIError
 from pydantic import BaseModel, Field
-from openai import OpenAI
 
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.express as px
-from datetime import datetime
 import numpy as np
-
-
 
 # Dry run mode
 DRY_RUN = False  # Set to False for actual API calls
@@ -32,8 +31,16 @@ INPUT_DIR = "input"  # Directory for input files
 OUTPUT_DIR = "output"  # Directory for output files
 CACHE_FILE = os.path.join(OUTPUT_DIR, 'ratings_cache.csv')
 
+USER_DIMENSIONS = [
+    ("complexity", "The level of difficulty or intricacy of the user's query"),
+    ("domain_specificity", "How specialized or niche the topic of the query is"),
+    ("ambiguity", "How clear or unclear the user's request is"),
+    ("abstraction_level", "Whether the query deals with concrete or abstract concepts"),
+    ("contextual_requirements", "How much context is needed to fully understand and address the query"),
+    ("linguistic_challenge", "The level of language proficiency required to understand and respond to the query"),
+    ("cognitive_demand", "The level of cognitive processing required to address the query")
+]
 
-# Define dimensions only once
 ASSISTANT_DIMENSIONS = [
     ("overall", "Overall quality of the response"),
     ("relevance", "How well the response addresses the user's query or task"),
@@ -51,26 +58,30 @@ ASSISTANT_DIMENSIONS = [
     ("non_sycophancy", "Ability to provide honest, critical feedback when appropriate instead of always agreeing")
 ]
 
-USER_DIMENSIONS = [
-    ("complexity", "The level of difficulty or intricacy of the user's query"),
-    ("domain_specificity", "How specialized or niche the topic of the query is"),
-    ("ambiguity", "How clear or unclear the user's request is"),
-    ("abstraction_level", "Whether the query deals with concrete or abstract concepts"),
-    ("contextual_requirements", "How much context is needed to fully understand and address the query"),
-    ("linguistic_challenge", "The level of language proficiency required to understand and respond to the query"),
-    ("cognitive_demand", "The level of cognitive processing required to address the query")
-]
-
 ALL_DIMENSIONS = [("a_" + dim[0], dim[1]) for dim in ASSISTANT_DIMENSIONS] + [("u_" + dim[0], dim[1]) for dim in USER_DIMENSIONS]
 
-
 class QualityRating(BaseModel):
-    pass
-
-for prefix, dimensions in [("a_", ASSISTANT_DIMENSIONS), ("u_", USER_DIMENSIONS)]:
-    for dim, _ in dimensions:
-        setattr(QualityRating, f"{prefix}{dim}", Field(..., ge=0, le=100))
-
+    a_overall: int
+    a_relevance: int
+    a_accuracy: int
+    a_coherence: int
+    a_completeness: int
+    a_clarity: int
+    a_conciseness: int
+    a_helpfulness: int
+    a_safety: int
+    a_creativity: int
+    a_language_quality: int
+    a_task_completion: int
+    a_contextual_understanding: int
+    a_non_sycophancy: int
+    u_complexity: int
+    u_domain_specificity: int
+    u_ambiguity: int
+    u_abstraction_level: int
+    u_contextual_requirements: int
+    u_linguistic_challenge: int
+    u_cognitive_demand: int
 
 @dataclass
 class Message:
@@ -86,10 +97,22 @@ class Conversation:
     update_time: float
     messages: List[Message]
 
+def ingest_conversations() -> Dict[str, Dict[Tuple[str, str], List[Conversation]]]:
+    import zipfile
+    import os
 
-def process_conversations(file_path: str) -> Dict[str, Dict[Tuple[str, str], List[Conversation]]]:
-    with open(file_path, 'r') as f:
-        data = json.load(f)
+    zip_files = [f for f in os.listdir('.') if f.endswith('.zip')]
+
+    if len(zip_files) != 1:
+        print("Error: There should be exactly one zip file in the current directory - the one with your ChatGPT Exported data.")
+        print("Download your data from ChatGPT: (top right -> Settings -> Data Controls -> Export your data)")
+        sys.exit(1)
+
+    zip_file = zip_files[0]
+
+    with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+        with zip_ref.open('conversations.json') as f:
+            data = json.load(f)
 
     organized_data = {}
 
@@ -112,7 +135,6 @@ def process_conversations(file_path: str) -> Dict[str, Dict[Tuple[str, str], Lis
         about_user = ''
 
         for msg in conversation.get('mapping', {}).values():
-
             message = msg.get('message')
 
             if message and message.get('metadata') and message['metadata'].get('user_context_message_data'):
@@ -213,18 +235,17 @@ def get_quality_rating(user_message: str, assistant_response: str, model_name: s
             ratings.update({dim[0]: random.randint(0, 100) for dim in ALL_DIMENSIONS})
         else:
             client = OpenAI()
-            completion = client.beta.chat.completions.parse(
-                model="gpt-4o-mini",
-                messages=[
+
+            msgs=[
                     {"role": "system", "content": """You are an AI quality rater.
 Your task is to rate the difficulty of the user's prompt and the quality of an AI assistant's response.
 Provide integer ratings from 0 to 100 for multiple dimensions,
 where 0 is easy prompt/very poor response and 100 is difficult prompt / excellent response."""},
 
                     {"role": "user", "content": f"""User message: {user_message}
-
+---
 Assistant response: {assistant_response}
-
+---
 Please rate the following dimensions with an integer between 0 and 100.
 
 For the assistant's response (prefix with 'a_'):
@@ -232,12 +253,23 @@ For the assistant's response (prefix with 'a_'):
 
 For the user's prompt difficulty (prefix with 'u_'):
 {', '.join([f"{dim[0]} ({dim[1]})" for dim in USER_DIMENSIONS])}"""}
-                ],
-                response_format=QualityRating,
+            ]
+
+            completion = client.chat.completions.create(
+                messages=msgs,
+                model="gpt-4o-mini",
+                response_format={ "type": "json_object" },
             )
 
-            parsed_ratings = completion.choices[0].message.parsed
-            ratings.update({k: int(v) for k, v in parsed_ratings.dict().items()})
+            parsed_ratings = json.loads(completion.choices[0].message.content)
+            ratings.update({k: int(v) for k, v in parsed_ratings.items()})
+
+            # Check if ratings now contains all of the keys in ALL_DIMENSIONS
+            missing_dimensions = set(dim[0] for dim in ALL_DIMENSIONS) - set(ratings.keys())
+            if missing_dimensions:
+                print(f"Warning: Missing ratings for dimensions: {missing_dimensions}")
+                for dim in missing_dimensions:
+                    ratings[dim] = 0  # Set a default value for missing dimensions
 
             # Calculate and print cost
             api_tokens = completion.usage.total_tokens
@@ -324,7 +356,6 @@ def save_messages_to_html(user_message: str, assistant_response: str, timestamp:
 def shorten_string(s, length):
     return f'{s[:length]}... [{len(s)}]'
 
-
 def generate_index(organized_conversations, ratings_cache):
     html_report = """<html><head>
 <style>body{font-family:Arial,sans-serif;} table{border-collapse:collapse;width:100%;} th,td{border:1px solid #ddd;padding:8px;text-align:left;} th{background-color:#f2f2f2;}</style>
@@ -343,6 +374,9 @@ Conversations are organized by model and your user/system prompt.
 </p>
 <p>
 See <a href="graphs.html">these plots with your results.</a>
+</p>
+<p>
+See <a href="activities.html">activity summaries.</a>
 </p>
 <h1>Conversation Analysis Report</h1>
 <h2>Index</h2>
@@ -401,6 +435,8 @@ See <a href="graphs.html">these plots with your results.</a>
 
     html_report += '</body></html>'
 
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     path = os.path.join(OUTPUT_DIR, 'index.html')
     with open(path, 'w', encoding='utf-8') as f:
         f.write(html_report)
@@ -411,13 +447,12 @@ See <a href="graphs.html">these plots with your results.</a>
 def process_uncached_ratings(organized_conversations, ratings_cache, cache_file):
     global cumulative_cost
     skip_counter = 0
+    processed_count = 0
 
     for model, conversations in organized_conversations.items():
         print(f"Processing model: {model}")
         about_id = 0
         for (about_user, about_model), convs in conversations.items():
-            processed_count = 0
-
             about_id += 1
             print(f"  Processing conversation group: {about_id}")
             for conv in convs:
@@ -439,13 +474,13 @@ def process_uncached_ratings(organized_conversations, ratings_cache, cache_file)
                     skip_counter += 1
                     continue
 
-
                 timestamp = datetime.fromtimestamp(conv.create_time).strftime('%Y%m%d_%H%M%S')
                 table_id = f"{model}_{about_id}"
 
                 if (timestamp, table_id) not in ratings_cache:
                     print(f"    Processing message: {table_id}")
                     ratings = get_quality_rating(user_message, assistant_response, model, timestamp, table_id)
+
                     save_rating_to_cache(cache_file, timestamp, table_id, model, ratings)
                     print(f"    Ratings calculated and saved for {table_id}")
                     processed_count += 1
@@ -455,12 +490,11 @@ def process_uncached_ratings(organized_conversations, ratings_cache, cache_file)
                 if processed_count >= MAX_RATED_COUNT:
                     print(f"\nReached maximum number of rated conversations ({MAX_RATED_COUNT})")
                     print(f"Total cost: ${cumulative_cost:.6f}")
-                    continue
+                    return
 
     print(f"\nProcessing complete. Total conversations processed: {processed_count}")
     print(f"Total conversations skipped due to image content: {skip_counter}")
     print(f"Total cost: ${cumulative_cost:.6f}")
-
 
 def get_color(rating):
     try:
@@ -485,7 +519,6 @@ def save_organized_conversations(organized_conversations, output_file):
 
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(serializable_data, f, indent=2, default=str, ensure_ascii=False)
-
 
 def create_multi_line_plot(df, x, y_list, title):
     fig = go.Figure()
@@ -524,8 +557,6 @@ def create_section_plots(df, table_id):
         normalized_metric = df[metric] / df['avg_prompt_complexity']
         plots.append(create_multi_line_plot(pd.DataFrame({'timestamp': df['timestamp'], metric: normalized_metric}), 'timestamp', [metric], f'Normalized {metric.capitalize()} Over Time - {table_id}'))
 
-
-
     # Heatmap: Correlation between metrics
     corr_metrics = [col for col in df.columns if col.startswith('a_') or col.startswith('u_')]
     corr_matrix = df[corr_metrics].corr()
@@ -536,7 +567,6 @@ def create_section_plots(df, table_id):
     return plots
 
 def generate_plots():
-
     df = pd.read_csv(CACHE_FILE)
     df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y%m%d_%H%M%S')
     df['avg_assistant_quality'] = df[['a_overall', 'a_relevance', 'a_accuracy', 'a_coherence', 'a_completeness', 'a_clarity', 'a_conciseness', 'a_helpfulness', 'a_task_completion', 'a_contextual_understanding', 'a_non_sycophancy']].mean(axis=1)
@@ -585,8 +615,93 @@ def generate_plots():
     with open("output/graphs.html", "w") as f:
         f.write(html)
 
+def generate_activity_summaries(organized_conversations):
+    activity_prompts = defaultdict(list)
 
-organized_conversations = process_conversations(os.path.join(INPUT_DIR, 'openai/conversations.json'))
+    for model, conversations in organized_conversations.items():
+        for (about_user, about_model), convs in conversations.items():
+            for conv in convs:
+                if len(conv.messages) >= 1:
+                    timestamp = datetime.fromtimestamp(conv.create_time)
+                    period_key = f"{timestamp.year}-{timestamp.month:02d}"
+                    user_message = conv.messages[0].content
+                    activity_prompts[period_key].append(user_message)
+
+    summaries = {}
+    client = OpenAI()
+
+    for period_key, prompts in activity_prompts.items():
+        year, month = map(int, period_key.split('-'))
+        period_name = f"{month_name[month]} {year}"
+
+
+        prompts = prompts[:3]
+
+        prompt_text = "\n---\n".join([f"{i+1}. {prompt}" for i, prompt in enumerate(prompts)])
+
+        print(f"Calling OpenAI API for {len(prompts)} prompts from {period_name}")
+
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are an AI assistant tasked with summarizing user activity based on their ChatGPT prompts."},
+                    {"role": "user", "content": f"""Here are the user's ChatGPT prompts.
+Respond with
+(1) one sentence on what kind of questions the user asked, with up to 3 bullets for the main themes.
+(2) one sentence on what the user was likely focused on during this period.
+Use HTML formatting (inside a <p>) and bullet lists.
+
+{prompt_text}"""}
+                ]
+            )
+            summary = response.choices[0].message.content.strip()
+            summaries[period_key] = summary + f" ({len(prompts)} prompts in total)"
+        except Exception as e:
+            print(f"Error generating summary for {period_name}: {str(e)}")
+            summaries[period_key] = f"Error generating summary: {str(e)}"
+
+    return summaries
+
+def generate_activities_report(summaries):
+    html_report = """
+    <html>
+    <head>
+        <title>User Activities Summary</title>
+        <style>
+            body { font-family: Arial, sans-serif; line-height: 1.6; padding: 20px; }
+            h1 { color: #333; }
+            .activity-summary { margin-bottom: 20px; padding: 10px; border: 1px solid #ddd; border-radius: 5px; }
+            .period-title { color: #0066cc; }
+        </style>
+    </head>
+    <body>
+        <h1>
+User Activities Summary</h1>
+    """
+
+    for period_key, summary in sorted(summaries.items(), reverse=True):
+        year, month = map(int, period_key.split('-'))
+        period_name = f"{month_name[month]} {year}"
+
+        html_report += f"""
+        <div class="activity-summary">
+            <h2 class="period-title">{period_name}</h2>
+            <p>{summary}</p>
+        </div>
+        """
+
+    html_report += "</body></html>"
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    path = os.path.join(OUTPUT_DIR, 'activities.html')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(html_report)
+    print(f"Activities report generated: {path}")
+
+    return path
+
+organized_conversations = ingest_conversations()
 
 ratings_cache = load_ratings_cache(CACHE_FILE)
 
@@ -603,6 +718,11 @@ process_uncached_ratings(organized_conversations, ratings_cache, CACHE_FILE)
 generate_index(organized_conversations, ratings_cache)
 
 generate_plots()
+
+# Generate activity summaries - WARNING - THESE CONTAIN PERSONAL DATA
+print("Generating activity summaries...")
+activity_summaries = generate_activity_summaries(organized_conversations)
+activities_report_path = generate_activities_report(activity_summaries)
 
 print("All the ratings are in output/ratings_cache.csv if you want to do your own analysis.")
 print(f"Look at {CACHE_FILE} for results.")
